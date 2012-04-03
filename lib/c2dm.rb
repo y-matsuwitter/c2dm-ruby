@@ -52,6 +52,9 @@ module C2DM
   class Sender
     def initialize email, passwd, cache_dir = nil
       @client = Client.new(fetch_auth_token(email, passwd, cache_dir))
+      @client.auth_token_callback = lambda do |client, old , token|
+        reflesh_cache(token)
+      end
     end
     
     def fetch_auth_token email, passwd, cache_dir = nil
@@ -76,6 +79,20 @@ module C2DM
       return auth_token
     end
     
+    def send_messages messages
+      succeeded = @client.send_messages messages
+      if succeeded.size != messages.size
+        to_retry = []
+        messages.each do |m|
+          to_retry.push(m) if !succeeded.include?(m)
+        end
+        @client.auth_token = fetch_auth_token(@email, @passwd, @cache_dir)
+        succeeded = @client.send_messages to_retry
+        raise InvalidAuthToken.new("Invalid Auth Token") if succeeded.size != to_retry.size
+      end
+      return messages
+    end
+    
     # retry once if invalid auth token error is raised
     def send_message registration_id, data, collapse_key=nil, delay_while_idle=false
       retried = false
@@ -86,6 +103,14 @@ module C2DM
         @client.auth_token = fetch_auth_token(@email, @passwd, @cache_dir)
         retried = true
         retry
+      end
+    end
+    
+    def reflesh_cache token
+      if @cache_dir
+        File.open(File.join(cache_dir,"auth_token_#{@email}"), "w") do |file|
+            file << token
+        end
       end
     end
   end
@@ -104,45 +129,46 @@ module C2DM
       @auth_token_callback.call(self, before, token) if @auth_token_callback
       token
     end
-
-    def send_message registration_id, data, collapse_key=nil, delay_while_idle=false
-      form_data = { 
-        'registration_id' => registration_id,
-        'collapse_key' => collapse_key || data.hash.to_s
-      }
-
-      form_data['delay_while_idle'] = '1' if delay_while_idle
-
-      # c2dm service will accept any message where the combined length of keys and values is <= 1024
-      data_length = C2DM::message_size data
-      raise MessageTooBig.new("message length #{data_length} > 1024") if data_length > 1024
-
-      data.each_pair do |key, value|
-        form_data["data.#{key}"] = value
-      end 
-
+    
+    def send_messages messages
+      succeeded = []
       headers = {'Authorization' => "GoogleLogin auth=#{@auth_token}" }
       http = Net::HTTP.new(host='android.apis.google.com', port=443)
       http.use_ssl = true
       http.verify_mode = OpenSSL::SSL::VERIFY_NONE
-      http.start
-
-      req = Net::HTTP::Post.new('/c2dm/send', initheader = headers)
-      req.set_form_data(form_data)
-
-      response = http.request(req)
-
-      if response['Update-Client-Auth']
-        # Auth token is getting stale. Update cleint to the new one, and trigger a callback if it exists
-        self.auth_token = response['Update-Client-Auth']
+      http.start do |http|
+        messages.each do |m|
+          req = Net::HTTP::Post.new('/c2dm/send', initheader = headers)
+          req.set_form_data(m.form_data)
+          response = http.request(req)
+          
+          if response['Update-Client-Auth']
+            # Auth token is getting stale. Update cleint to the new one, and trigger a callback if it exists
+            self.auth_token = response['Update-Client-Auth']
+          end
+          begin
+            check_response response
+            succeeded.push(m)
+          rescue InvalidAuthToken => e
+            break
+          end
+        end
       end
-
+      return succeeded
+    end
+    
+    def send_message registration_id, data, collapse_key=nil, delay_while_idle=false
+      return send_messages([Message.new(registration_id, data, collapse_key, delay_while_idle)])
+    end
+    
+    private
+    def check_response response
       case response
       when Net::HTTPSuccess
         if response.body =~ /^Error=(.*)$/
           raise_error $1
         elsif response.body =~ /^id=(.*)$/
-          $1
+          return $1
         else
           raise C2DMException.new "Invalid response body: #{response.body}"
         end
@@ -152,8 +178,7 @@ module C2DM
         raise C2DMException.new "Invalid response code: #{response.code}"
       end
     end
-
-    private
+    
     def raise_error error_name
       exception = case error_name
       when 'QuotaExceeded'
@@ -173,6 +198,33 @@ module C2DM
       end
 
       raise exception.new("Server returned '#{error_name}'")
+    end
+  end
+  
+  class Message
+    def initialize registration_id, data, collapse_key = nil, delay_while_idle = nil
+      @registration_id = registration_id
+      @data = data
+      @collapse_key = collapse_key
+      @delay_while_idle = delay_while_idle
+      
+      # c2dm service will accept any message where the combined length of keys and values is <= 1024
+      data_length = C2DM::message_size data
+      raise MessageTooBig.new("message length #{data_length} > 1024") if data_length > 1024
+    end
+    
+    def form_data
+      form_data = { 
+        'registration_id' => @registration_id,
+        'collapse_key' => @collapse_key || @data.hash.to_s
+      }
+      
+      form_data['delay_while_idle'] = '1' if @delay_while_idle
+      
+      @data.each_pair do |key, value|
+        form_data["data.#{key}"] = value
+      end 
+      return form_data
     end
   end
 end
