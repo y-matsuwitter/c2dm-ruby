@@ -1,3 +1,4 @@
+require 'net/https'
 
 module C2DM
   class C2DMException < Exception
@@ -22,7 +23,73 @@ module C2DM
       sum + pair[0].to_s.length + pair[1].to_s.length
     end
   end
-
+  
+  def self.get_auth_token email, passwd
+    auth_token_path = "/accounts/ClientLogin"
+    data = ["accountType=HOSTED_OR_GOOGLE",
+            "Email=#{email}",
+            "Passwd=#{passwd}",
+            "service=ac2dm",
+            "source=jp.co.techfirm.c2dm"].join('&')
+    
+    headers = {'Content-Type' => 'application/x-www-form-urlencoded'}
+    token = ''
+    http = Net::HTTP.new(host = "www.google.com", port = 443)
+    http.use_ssl = true
+    http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+    http.start do |http|
+      response, body = http.post(auth_token_path, data, headers)
+      case response
+      when Net::HTTPOK
+        token = body[/Auth=(.*)/, 1]
+      else
+        raise C2DMException.new("Invalid request #{response.body}")
+      end
+    end
+    return token
+  end
+  
+  class Sender
+    def initialize email, passwd, cache_dir = nil
+      @client = Client.new(fetch_auth_token(email, passwd, cache_dir))
+    end
+    
+    def fetch_auth_token email, passwd, cache_dir = nil
+      auth_token = ""
+      @email = email
+      @passwd = @passwd
+      @cache_dir = cache_dir
+      if cache_dir
+        File.open(File.join(cache_dir,"auth_token_#{email}"), "r") do |file|
+          auth_token = file.read
+        end
+      end
+      
+      if !auth_token || auth_token == ""
+        auth_token = C2DM::get_auth_token(email, passwd)
+        if cache_dir
+          File.open(File.join(cache_dir,"auth_token_#{email}"), "w") do |file|
+            file << auth_token
+          end
+        end
+      end
+      return auth_token
+    end
+    
+    # retry once if invalid auth token error is raised
+    def send_message registration_id, data, collapse_key=nil, delay_while_idle=false
+      retried = false
+      begin
+        return @client.send_message registration_id, data, collapse_key, delay_while_idle
+      rescue InvalidAuthToken => e
+        raise e if retried
+        @client.auth_token = fetch_auth_token(@email, @passwd, @cache_dir)
+        retried = true
+        retry
+      end
+    end
+  end
+  
   class Client
     attr_reader :auth_token
     attr_accessor :auth_token_callback
