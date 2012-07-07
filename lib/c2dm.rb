@@ -24,13 +24,13 @@ module C2DM
     end
   end
   
-  def self.get_auth_token email, passwd
+  def self.get_auth_token email, passwd, source
     auth_token_path = "/accounts/ClientLogin"
-    data = ["accountType=HOSTED_OR_GOOGLE",
+    data = ["accountType=GOOGLE",
             "Email=#{email}",
             "Passwd=#{passwd}",
             "service=ac2dm",
-            "source=jp.co.techfirm.c2dm"].join('&')
+            "source=#{source}"].join('&')
     
     headers = {'Content-Type' => 'application/x-www-form-urlencoded'}
     token = ''
@@ -38,7 +38,8 @@ module C2DM
     http.use_ssl = true
     http.verify_mode = OpenSSL::SSL::VERIFY_NONE
     http.start do |http|
-      response, body = http.post(auth_token_path, data, headers)
+      response= http.post(auth_token_path, data, headers)
+      body = response.body
       case response
       when Net::HTTPOK
         token = body[/Auth=(.*)/, 1]
@@ -50,17 +51,18 @@ module C2DM
   end
   
   class Sender
-    def initialize email, passwd, cache_dir = nil
-      @client = Client.new(fetch_auth_token(email, passwd, cache_dir))
+    def initialize email, passwd, source, cache_dir = nil
+      @client = Client.new(fetch_auth_token(email, passwd, source, cache_dir))
       @client.auth_token_callback = lambda do |client, old , token|
         reflesh_cache(token)
       end
     end
     
-    def fetch_auth_token email, passwd, cache_dir = nil
+    def fetch_auth_token email, passwd, source, cache_dir = nil
       auth_token = ""
       @email = email
-      @passwd = @passwd
+      @passwd = passwd
+      @source = source
       @cache_dir = cache_dir
       if cache_dir
         File.open(File.join(cache_dir,"auth_token_#{email}"), "r") do |file|
@@ -69,7 +71,7 @@ module C2DM
       end
       
       if !auth_token || auth_token == ""
-        auth_token = C2DM::get_auth_token(email, passwd)
+        auth_token = C2DM::get_auth_token(email, passwd, source)
         if cache_dir
           File.open(File.join(cache_dir,"auth_token_#{email}"), "w") do |file|
             file << auth_token
@@ -86,7 +88,7 @@ module C2DM
         messages.each do |m|
           to_retry.push(m) if !succeeded.include?(m)
         end
-        @client.auth_token = fetch_auth_token(@email, @passwd, @cache_dir)
+        @client.auth_token = fetch_auth_token(@email, @passwd,@source, @cache_dir)
         succeeded = @client.send_messages to_retry
         raise InvalidAuthToken.new("Invalid Auth Token") if succeeded.size != to_retry.size
       end
@@ -100,7 +102,7 @@ module C2DM
         return @client.send_message registration_id, data, collapse_key, delay_while_idle
       rescue InvalidAuthToken => e
         raise e if retried
-        @client.auth_token = fetch_auth_token(@email, @passwd, @cache_dir)
+        @client.auth_token = fetch_auth_token(@email, @passwd, @source, @cache_dir)
         retried = true
         retry
       end
@@ -141,7 +143,6 @@ module C2DM
           req = Net::HTTP::Post.new('/c2dm/send', initheader = headers)
           req.set_form_data(m.form_data)
           response = http.request(req)
-          
           if response['Update-Client-Auth']
             # Auth token is getting stale. Update cleint to the new one, and trigger a callback if it exists
             self.auth_token = response['Update-Client-Auth']
